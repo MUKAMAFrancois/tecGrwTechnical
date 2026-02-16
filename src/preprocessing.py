@@ -3,6 +3,7 @@ import torch
 import torchaudio
 from datasets import load_dataset
 from tqdm import tqdm
+import getpass  
 from src.config import (
     HF_DATASET_ID, 
     TARGET_SAMPLE_RATE, 
@@ -33,8 +34,17 @@ def preprocess_audio(waveform, sr):
     return waveform.cpu() 
 
 def main():
-    print(f"Loading {HF_DATASET_ID}...")
-    dataset = load_dataset(HF_DATASET_ID, split="train", token=True)
+    print(f"Authenticating for {HF_DATASET_ID}...")
+    # --- ADDED: Prompt for Token (Like loader.py) ---
+    token = getpass.getpass("Enter your HuggingFace token: ")
+    
+    print(f"Loading Dataset...")
+    # --- CHANGED: Pass token variable instead of token=True ---
+    try:
+        dataset = load_dataset(HF_DATASET_ID, split="train", token=token)
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        return
     
     wavs_dir = os.path.join(PROCESSED_DIR, "wavs")
     os.makedirs(wavs_dir, exist_ok=True)
@@ -69,6 +79,8 @@ def main():
             
         # 5. Process on GPU
         processed_wav = preprocess_audio(audio_array, orig_sr)
+        
+        # 6. Convert to Int16 (Fixes Silent Audio)
         wav_int16 = (processed_wav * 32767).clamp(-32768, 32767).to(torch.int16)
         
         filename = f"kin_spk{TARGET_SPEAKER_ID}_{i:05d}.wav"
@@ -84,7 +96,7 @@ def main():
         for line in metadata:
             f.write(line + "\n")
             
-    print("\nProcessing Complete!")
+    print("\n Processing Complete!")
     print(f"   - Selected Speaker: {TARGET_SPEAKER_ID}")
     print(f"   - Saved Samples: {len(metadata)}")
     print(f"   - Dropped (Wrong Speaker): {dropped_counts['speaker']}")
