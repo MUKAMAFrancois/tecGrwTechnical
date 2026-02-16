@@ -35,7 +35,7 @@ def run_training(epochs=30):
     config = VitsConfig(
         audio=audio_config,
         run_name="kin_vits_production",
-        batch_size=16,          # <-- Reduced to 16 for safety
+        batch_size=16,         
         eval_batch_size=8,
         batch_group_size=4,
         num_loader_workers=4,
@@ -48,9 +48,8 @@ def run_training(epochs=30):
         lr_gen=2e-4, 
         lr_disc=2e-4,
         
-        # --- KEY FIX: Disable Phonemes for Kinyarwanda ---
         text_cleaner="basic_cleaners",
-        use_phonemes=False,      # <-- Changed to False
+        use_phonemes=False,      
         compute_input_seq_cache=True,
         # -------------------------------------------------
         
