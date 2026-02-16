@@ -9,6 +9,37 @@ from TTS.utils.audio import AudioProcessor
 from TTS.tts.utils.text.tokenizer import TTSTokenizer
 from src.config import PROCESSED_DIR, TARGET_SAMPLE_RATE
 
+def kin_formatter(root_path, manifest_file, **kwargs):
+    """
+    Reads the metadata file created by preprocessing.py.
+    Format: filename.wav|text
+    """
+    items = []
+    with open(manifest_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Split by |
+            cols = line.split("|")
+            if len(cols) < 2:
+                continue
+                
+            wav_filename = cols[0] # e.g., kin_spk1_00001.wav
+            text = cols[1]
+  
+            wav_path = os.path.join(root_path, "wavs", wav_filename)
+            
+            items.append({
+                "text": text,
+                "audio_file": wav_path,
+                "speaker_name": "kin_spk1",
+                "root_path": root_path,
+                "language": "kin"
+            })
+    return items
+
 def run_training(epochs=30):
     output_path = "/content/output"
     dataset_path = PROCESSED_DIR
@@ -16,9 +47,9 @@ def run_training(epochs=30):
     
     # Dataset Config
     dataset_config = BaseDatasetConfig(
-        formatter="ljspeech", 
+        formatter=kin_formatter,     
         meta_file_train=meta_file,
-        path=os.path.join(dataset_path, "wavs")
+        path=dataset_path            
     )
     
     # Audio Config
@@ -35,7 +66,7 @@ def run_training(epochs=30):
     config = VitsConfig(
         audio=audio_config,
         run_name="kin_vits_production",
-        batch_size=16,         
+        batch_size=16,
         eval_batch_size=8,
         batch_group_size=4,
         num_loader_workers=4,
@@ -48,10 +79,10 @@ def run_training(epochs=30):
         lr_gen=2e-4, 
         lr_disc=2e-4,
         
+        # Kinyarwanda Settings (No Phonemes)
         text_cleaner="basic_cleaners",
-        use_phonemes=False,      
+        use_phonemes=False,
         compute_input_seq_cache=True,
-        # -------------------------------------------------
         
         # Logging & Saving
         print_step=25,
@@ -70,7 +101,7 @@ def run_training(epochs=30):
         ]
     )
 
-    # Initialize Tokenizer (Now uses characters, not phonemes)
+    # Initialize Tokenizer
     tokenizer, config = TTSTokenizer.init_from_config(config)
 
     # Load Data
@@ -94,7 +125,7 @@ def run_training(epochs=30):
         eval_samples=eval_samples,
     )
 
-    print(f"🚀 Starting VITS Training for {epochs} epochs...")
+    print(f"Starting VITS Training for {epochs} epochs...")
     trainer.fit()
 
 if __name__ == "__main__":
