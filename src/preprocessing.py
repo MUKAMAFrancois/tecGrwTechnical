@@ -69,10 +69,11 @@ def main():
             
         # 5. Process on GPU
         processed_wav = preprocess_audio(audio_array, orig_sr)
+        wav_int16 = (processed_wav * 32767).clamp(-32768, 32767).to(torch.int16)
         
         filename = f"kin_spk{TARGET_SPEAKER_ID}_{i:05d}.wav"
         save_path = os.path.join(wavs_dir, filename)
-        torchaudio.save(save_path, processed_wav, TARGET_SAMPLE_RATE)
+        torchaudio.save(save_path, wav_int16, TARGET_SAMPLE_RATE)
         
         # 7. Metadata
         metadata.append(f"{filename}|{text}")
