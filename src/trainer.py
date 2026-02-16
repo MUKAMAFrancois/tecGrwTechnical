@@ -9,7 +9,6 @@ from TTS.utils.audio import AudioProcessor
 from TTS.tts.utils.text.tokenizer import TTSTokenizer
 from src.config import PROCESSED_DIR, TARGET_SAMPLE_RATE
 
-# --- 1. Custom Formatter (FIXED) ---
 def kin_formatter(root_path, manifest_file, **kwargs):
     """
     Reads the metadata file created by preprocessing.py.
@@ -33,7 +32,6 @@ def kin_formatter(root_path, manifest_file, **kwargs):
             items.append({
                 "text": text,
                 "audio_file": wav_path,
-                # --- FIX: ADD AUDIO UNIQUE NAME ---
                 "audio_unique_name": wav_filename, 
                 "speaker_name": "kin_spk1",
                 "root_path": root_path,
@@ -41,7 +39,7 @@ def kin_formatter(root_path, manifest_file, **kwargs):
             })
     return items
 
-def run_training(epochs=30):
+def run_training(epochs=200):
     output_path = "/content/output"
     dataset_path = PROCESSED_DIR
     meta_file = os.path.join(dataset_path, "metadata.csv")
@@ -63,39 +61,26 @@ def run_training(epochs=30):
         mel_fmax=None
     )
 
-    # Model Config
     config = VitsConfig(
         audio=audio_config,
-        run_name="kin_vits_production",
-        batch_size=16,
-        eval_batch_size=8,
+        run_name="kin_vits_production_a100",
+        batch_size=64,               # Speed up with A100 VRAM
+        eval_batch_size=16,
         batch_group_size=4,
-        
-        # --- FIX: Reduce workers to prevent Colab freeze ---
-        num_loader_workers=2,
-        num_eval_loader_workers=2,
-        
-        # Training Steps
+        num_loader_workers=4,        # Faster data loading
+        num_eval_loader_workers=4,
         run_eval=True,
-        test_delay_epochs=0, # Start testing immediately (Epoch 0)
-        epochs=epochs,
+        test_delay_epochs=0, 
+        epochs=epochs,               # 200
         lr_gen=2e-4, 
         lr_disc=2e-4,
-        
-        # Kinyarwanda Settings
         text_cleaner="basic_cleaners",
         use_phonemes=False, 
         compute_input_seq_cache=True,
-        
-        # Logging & Saving
-        print_step=25,        # Print metrics every 25 steps
-        print_eval=True,      # Print eval metrics
-        mixed_precision=True,
+        mixed_precision=True,        # Keep this for A100 speedup
         output_path=output_path,
         datasets=[dataset_config],
-        save_step=500,        # Save checkpoint frequently
-        
-        # Test Sentences (You will hear these in TensorBoard)
+        save_step=1000,              # Save every 1k steps
         test_sentences=[
             "Muraho, nagufasha gute uyu munsi?",
             "Niba ufite ibibazo bijyanye n'ubuzima bwawe, twagufasha.",
