@@ -13,11 +13,15 @@ def run_training(epochs=30):
     output_path = "/content/output"
     dataset_path = PROCESSED_DIR
     meta_file = os.path.join(dataset_path, "metadata.csv")
+    
+    # Dataset Config
     dataset_config = BaseDatasetConfig(
         formatter="ljspeech", 
         meta_file_train=meta_file,
         path=os.path.join(dataset_path, "wavs")
     )
+    
+    # Audio Config
     audio_config = VitsAudioConfig(
         sample_rate=TARGET_SAMPLE_RATE,
         win_length=1024,
@@ -27,10 +31,11 @@ def run_training(epochs=30):
         mel_fmax=None
     )
 
+    # Model Config
     config = VitsConfig(
         audio=audio_config,
         run_name="kin_vits_production",
-        batch_size=32,   
+        batch_size=16,          # <-- Reduced to 16 for safety
         eval_batch_size=8,
         batch_group_size=4,
         num_loader_workers=4,
@@ -43,11 +48,11 @@ def run_training(epochs=30):
         lr_gen=2e-4, 
         lr_disc=2e-4,
         
+        # --- KEY FIX: Disable Phonemes for Kinyarwanda ---
         text_cleaner="basic_cleaners",
-        use_phonemes=True,
-        phoneme_language="run",
-        phoneme_cache_path=os.path.join(output_path, "phoneme_cache"),
+        use_phonemes=False,      # <-- Changed to False
         compute_input_seq_cache=True,
+        # -------------------------------------------------
         
         # Logging & Saving
         print_step=25,
@@ -66,6 +71,7 @@ def run_training(epochs=30):
         ]
     )
 
+    # Initialize Tokenizer (Now uses characters, not phonemes)
     tokenizer, config = TTSTokenizer.init_from_config(config)
 
     # Load Data
@@ -76,8 +82,10 @@ def run_training(epochs=30):
         eval_split_size=0.1,
     )
 
+    # Initialize Model
     model = Vits(config, ap=AudioProcessor.init_from_config(config), tokenizer=tokenizer, speaker_manager=None)
 
+    # Initialize Trainer
     trainer = Trainer(
         TrainerArgs(),
         config,
@@ -87,7 +95,7 @@ def run_training(epochs=30):
         eval_samples=eval_samples,
     )
 
-    print(f"Starting VITS Training for {epochs} epochs...")
+    print(f"🚀 Starting VITS Training for {epochs} epochs...")
     trainer.fit()
 
 if __name__ == "__main__":
