@@ -9,16 +9,14 @@ wheels/
 # Virtual environments
 .venv
 
-# env file
-.env
-.DS_Store
-
-data/
-output/
-logs/
-
-.vscode/
-.idea/
-sample_data/
-#
+#MD files
 *.md
+
+# data
+data/
+
+# checkpoints
+checkpoints/
+
+# env
+.env
