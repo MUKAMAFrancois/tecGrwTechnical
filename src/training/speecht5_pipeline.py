@@ -281,6 +281,7 @@ def build_trainer_bundle(
         report_to="none",
         remove_unused_columns=False,
         save_strategy="epoch",
+        label_names=["labels"],
     )
 
     _set_eval_strategy(base_kwargs, "epoch")
@@ -304,4 +305,6 @@ def build_trainer_bundle(
         trainer_kwargs["tokenizer"] = processor.tokenizer
 
     trainer = Seq2SeqTrainer(**trainer_kwargs)
+    if not getattr(trainer, "label_names", None):
+        trainer.label_names = ["labels"]
     return TrainerBundle(args=args, trainer=trainer, output_dir=output_dir)
