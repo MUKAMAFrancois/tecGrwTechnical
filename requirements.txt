@@ -1,1 +1,10 @@
-ÿþ
+torch
+torchaudio
+transformers
+datasets
+soundfile
+numpy
+pandas
+speechbrain
+pyyaml
+tqdm

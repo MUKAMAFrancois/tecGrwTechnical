@@ -1,13 +1,46 @@
+import copy
+import json
+import re
 import time
 import warnings
 import zipfile
-import copy
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 import torch
 from transformers import SpeechT5ForTextToSpeech
+
+
+@dataclass(frozen=True)
+class DecodeProfile:
+    name: str
+    threshold: float
+    minlenratio: float
+    maxlenratio: float
+
+
+BENCHMARK_FAST_PROFILE = DecodeProfile(
+    name="benchmark_fast",
+    threshold=0.50,
+    minlenratio=0.0,
+    maxlenratio=9.0,
+)
+
+ROBUST_FULL_PROFILE = DecodeProfile(
+    name="robust_full",
+    threshold=0.58,
+    minlenratio=0.08,
+    maxlenratio=18.0,
+)
+
+ROBUST_RETRY_PROFILE = DecodeProfile(
+    name="robust_full_retry",
+    threshold=0.65,
+    minlenratio=0.12,
+    maxlenratio=22.0,
+)
 
 
 def load_finetuned_model(checkpoint_path, device):
@@ -52,6 +85,39 @@ def _sync_cuda(device):
         torch.cuda.synchronize(device)
 
 
+def _normalize_text_for_tts(text, strong=False):
+    normalized = str(text or "").strip()
+    normalized = normalized.replace("\u2019", "'")
+    normalized = normalized.replace("\u2018", "'")
+    normalized = normalized.replace("\u201c", '"')
+    normalized = normalized.replace("\u201d", '"')
+    normalized = normalized.replace("\u2013", "-")
+    normalized = normalized.replace("\u2014", "-")
+    normalized = normalized.replace("...", ".")
+
+    if strong:
+        normalized = normalized.replace(",", " ")
+        normalized = normalized.replace(";", " ")
+        normalized = normalized.replace(":", " ")
+        normalized = normalized.replace("(", " ")
+        normalized = normalized.replace(")", " ")
+    else:
+        normalized = normalized.replace(";", ",")
+        normalized = normalized.replace(":", ",")
+
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _word_count(text):
+    return len(re.findall(r"[A-Za-z']+", str(text or "")))
+
+
+def _min_expected_duration_seconds(text, min_duration_per_word=0.24):
+    words = max(1, _word_count(text))
+    return max(1.0, words * float(min_duration_per_word))
+
+
 def _generate_speech(
     model,
     processor,
@@ -59,11 +125,16 @@ def _generate_speech(
     text,
     speaker_embedding,
     device,
-    threshold=0.5,
-    minlenratio=0.0,
-    maxlenratio=12.0,
+    profile=None,
+    normalize_punctuation=True,
+    return_meta=False,
 ):
-    inputs = processor(text=text, return_tensors="pt")
+    if profile is None:
+        profile = ROBUST_FULL_PROFILE
+
+    input_text = _normalize_text_for_tts(text) if normalize_punctuation else str(text or "")
+
+    inputs = processor(text=input_text, return_tensors="pt")
     input_ids = inputs["input_ids"].to(device)
 
     use_amp = hasattr(device, "type") and device.type == "cuda"
@@ -73,21 +144,17 @@ def _generate_speech(
                 input_ids,
                 speaker_embedding,
                 vocoder=vocoder,
-                threshold=threshold,
-                minlenratio=minlenratio,
-                maxlenratio=maxlenratio,
+                threshold=float(profile.threshold),
+                minlenratio=float(profile.minlenratio),
+                maxlenratio=float(profile.maxlenratio),
             )
     wav = speech.detach().float().cpu().numpy()
     wav = np.asarray(wav, dtype=np.float32).squeeze()
     if wav.ndim != 1:
         wav = wav.reshape(-1)
+    if return_meta:
+        return wav, {"text": input_text, "profile": profile.name}
     return wav
-
-
-def _min_expected_duration_seconds(text):
-    # Heuristic floor to catch obvious early cutoffs.
-    words = max(1, len(str(text).split()))
-    return max(1.0, words * 0.20)
 
 
 def _trim_trailing_silence(
@@ -114,6 +181,37 @@ def _trim_trailing_silence(
     return wav[:end]
 
 
+def _is_incomplete_generation(
+    wav,
+    text,
+    sample_rate,
+    min_duration_per_word=0.24,
+):
+    if wav is None:
+        return True, "missing_wav"
+
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if wav.size == 0:
+        return True, "empty_wav"
+
+    duration_sec = float(wav.size / float(sample_rate))
+    expected = _min_expected_duration_seconds(text, min_duration_per_word=min_duration_per_word)
+    if duration_sec < expected:
+        return True, f"duration_too_short:{duration_sec:.2f}s<{expected:.2f}s"
+
+    peak = float(np.max(np.abs(wav)))
+    if peak <= 1e-8:
+        return True, "silent_wav"
+
+    end_window = max(1, int(sample_rate * 0.12))
+    tail = np.abs(wav[-end_window:])
+    tail_ratio = float(np.mean(tail > (peak * 0.015)))
+    if tail_ratio < 0.01:
+        return True, "dead_tail"
+
+    return False, "ok"
+
+
 def synthesize_test_sentences(
     model,
     processor,
@@ -123,13 +221,20 @@ def synthesize_test_sentences(
     output_dir,
     device,
     sample_rate=16000,
-    fast_maxlenratio=11.0,
-    safe_maxlenratio=20.0,
+    profile=None,
+    retry_profile=None,
     retry_for_completeness=True,
+    normalize_punctuation=True,
+    min_duration_per_word=0.24,
     trim_trailing_silence=True,
     silence_trim_db=-42.0,
     silence_keep_tail_ms=120.0,
 ):
+    if profile is None:
+        profile = ROBUST_FULL_PROFILE
+    if retry_profile is None:
+        retry_profile = ROBUST_RETRY_PROFILE
+
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -137,6 +242,8 @@ def synthesize_test_sentences(
     output_paths = []
 
     for idx, text in enumerate(sentences, start=1):
+        strong_text = _normalize_text_for_tts(text, strong=True)
+
         wav = _generate_speech(
             model,
             processor,
@@ -144,22 +251,9 @@ def synthesize_test_sentences(
             text,
             spk,
             device,
-            threshold=0.40,
-            maxlenratio=fast_maxlenratio,
+            profile=profile,
+            normalize_punctuation=normalize_punctuation,
         )
-        duration_sec = float(len(wav) / float(sample_rate)) if len(wav) > 0 else 0.0
-        if retry_for_completeness and duration_sec < _min_expected_duration_seconds(text):
-            wav = _generate_speech(
-                model,
-                processor,
-                vocoder,
-                text,
-                spk,
-                device,
-                threshold=0.50,
-                maxlenratio=safe_maxlenratio,
-            )
-
         if trim_trailing_silence:
             wav = _trim_trailing_silence(
                 wav,
@@ -167,6 +261,66 @@ def synthesize_test_sentences(
                 rel_db=silence_trim_db,
                 keep_tail_ms=silence_keep_tail_ms,
             )
+
+        incomplete, reason = _is_incomplete_generation(
+            wav,
+            text,
+            sample_rate=sample_rate,
+            min_duration_per_word=min_duration_per_word,
+        )
+
+        if retry_for_completeness and incomplete:
+            wav = _generate_speech(
+                model,
+                processor,
+                vocoder,
+                text,
+                spk,
+                device,
+                profile=retry_profile,
+                normalize_punctuation=normalize_punctuation,
+            )
+            if trim_trailing_silence:
+                wav = _trim_trailing_silence(
+                    wav,
+                    sample_rate=sample_rate,
+                    rel_db=silence_trim_db,
+                    keep_tail_ms=silence_keep_tail_ms,
+                )
+            incomplete, reason = _is_incomplete_generation(
+                wav,
+                text,
+                sample_rate=sample_rate,
+                min_duration_per_word=min_duration_per_word,
+            )
+
+        if retry_for_completeness and incomplete:
+            wav = _generate_speech(
+                model,
+                processor,
+                vocoder,
+                strong_text,
+                spk,
+                device,
+                profile=retry_profile,
+                normalize_punctuation=False,
+            )
+            if trim_trailing_silence:
+                wav = _trim_trailing_silence(
+                    wav,
+                    sample_rate=sample_rate,
+                    rel_db=silence_trim_db,
+                    keep_tail_ms=silence_keep_tail_ms,
+                )
+            incomplete, reason = _is_incomplete_generation(
+                wav,
+                text,
+                sample_rate=sample_rate,
+                min_duration_per_word=min_duration_per_word,
+            )
+
+        if incomplete:
+            print(f"Warning: sample_{idx:02d} may be incomplete ({reason})")
 
         out_path = out_dir / f"sentence_{idx:02d}.wav"
         sf.write(str(out_path), wav, sample_rate)
@@ -180,31 +334,35 @@ def measure_latency(
     processor,
     vocoder,
     speaker_embedding,
-    sentences,
+    sentence,
     device,
-    warmup_runs=1,
-    maxlenratio=11.0,
-    threshold=0.40,
+    profile=None,
+    warmup_runs=3,
+    num_runs=20,
+    normalize_punctuation=True,
 ):
-    if not sentences:
-        return [], float("nan")
+    if profile is None:
+        profile = BENCHMARK_FAST_PROFILE
+    if sentence is None or str(sentence).strip() == "":
+        return [], float("nan"), float("nan"), float("nan")
 
     spk = _to_speaker_tensor(speaker_embedding, device)
+    text = str(sentence)
 
     for _ in range(max(0, int(warmup_runs))):
         _ = _generate_speech(
             model,
             processor,
             vocoder,
-            sentences[0],
+            text,
             spk,
             device,
-            threshold=threshold,
-            maxlenratio=maxlenratio,
+            profile=profile,
+            normalize_punctuation=normalize_punctuation,
         )
 
     latencies_ms = []
-    for text in sentences:
+    for _ in range(max(1, int(num_runs))):
         _sync_cuda(device)
         t0 = time.perf_counter()
         _ = _generate_speech(
@@ -214,8 +372,8 @@ def measure_latency(
             text,
             spk,
             device,
-            threshold=threshold,
-            maxlenratio=maxlenratio,
+            profile=profile,
+            normalize_punctuation=normalize_punctuation,
         )
         _sync_cuda(device)
         t1 = time.perf_counter()
@@ -223,7 +381,9 @@ def measure_latency(
         latencies_ms.append((t1 - t0) * 1000.0)
 
     mean_ms = float(np.mean(latencies_ms)) if latencies_ms else float("nan")
-    return latencies_ms, mean_ms
+    p50_ms = float(np.percentile(latencies_ms, 50)) if latencies_ms else float("nan")
+    p95_ms = float(np.percentile(latencies_ms, 95)) if latencies_ms else float("nan")
+    return latencies_ms, mean_ms, p50_ms, p95_ms
 
 
 def export_final_model_package(model, processor, output_dir, save_dtype="float32"):
@@ -253,6 +413,37 @@ def export_final_model_package(model, processor, output_dir, save_dtype="float32
     processor.save_pretrained(str(out_dir))
     if hasattr(model, "generation_config") and model.generation_config is not None:
         model.generation_config.save_pretrained(str(out_dir))
+    return out_dir
+
+
+def export_int8_deployment_bundle(
+    model,
+    processor,
+    output_dir,
+    base_model_id="microsoft/speecht5_tts",
+    source_checkpoint=None,
+):
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    int8_path = export_int8_dynamic_artifact(model, out_dir / "model_int8_state_dict.pt")
+
+    model.config.save_pretrained(str(out_dir))
+    processor.save_pretrained(str(out_dir))
+    if hasattr(model, "generation_config") and model.generation_config is not None:
+        model.generation_config.save_pretrained(str(out_dir))
+
+    manifest = {
+        "format": "speecht5_int8_dynamic_state_dict",
+        "base_model_id": str(base_model_id),
+        "source_checkpoint": str(source_checkpoint) if source_checkpoint is not None else None,
+        "weights_file": str(int8_path.name),
+        "total_size_mb": round(get_directory_size_mb(out_dir), 2),
+    }
+    (out_dir / "artifact_manifest.json").write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
     return out_dir
 
 
