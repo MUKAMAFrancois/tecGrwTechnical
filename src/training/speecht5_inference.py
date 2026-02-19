@@ -77,13 +77,41 @@ def _generate_speech(
                 minlenratio=minlenratio,
                 maxlenratio=maxlenratio,
             )
-    return speech.detach().float().cpu().numpy()
+    wav = speech.detach().float().cpu().numpy()
+    wav = np.asarray(wav, dtype=np.float32).squeeze()
+    if wav.ndim != 1:
+        wav = wav.reshape(-1)
+    return wav
 
 
 def _min_expected_duration_seconds(text):
     # Heuristic floor to catch obvious early cutoffs.
     words = max(1, len(str(text).split()))
     return max(1.0, words * 0.20)
+
+
+def _trim_trailing_silence(
+    wav,
+    sample_rate,
+    rel_db=-42.0,
+    keep_tail_ms=120.0,
+):
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if wav.size == 0:
+        return wav
+
+    peak = float(np.max(np.abs(wav)))
+    if peak <= 1e-8:
+        return wav
+
+    amplitude_threshold = peak * float(10.0 ** (rel_db / 20.0))
+    voiced = np.where(np.abs(wav) > amplitude_threshold)[0]
+    if voiced.size == 0:
+        return wav
+
+    keep_tail = max(0, int((keep_tail_ms / 1000.0) * float(sample_rate)))
+    end = min(int(wav.size), int(voiced[-1]) + keep_tail + 1)
+    return wav[:end]
 
 
 def synthesize_test_sentences(
@@ -98,6 +126,9 @@ def synthesize_test_sentences(
     fast_maxlenratio=11.0,
     safe_maxlenratio=20.0,
     retry_for_completeness=True,
+    trim_trailing_silence=True,
+    silence_trim_db=-42.0,
+    silence_keep_tail_ms=120.0,
 ):
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -113,6 +144,7 @@ def synthesize_test_sentences(
             text,
             spk,
             device,
+            threshold=0.40,
             maxlenratio=fast_maxlenratio,
         )
         duration_sec = float(len(wav) / float(sample_rate)) if len(wav) > 0 else 0.0
@@ -124,7 +156,16 @@ def synthesize_test_sentences(
                 text,
                 spk,
                 device,
+                threshold=0.50,
                 maxlenratio=safe_maxlenratio,
+            )
+
+        if trim_trailing_silence:
+            wav = _trim_trailing_silence(
+                wav,
+                sample_rate=sample_rate,
+                rel_db=silence_trim_db,
+                keep_tail_ms=silence_keep_tail_ms,
             )
 
         out_path = out_dir / f"sentence_{idx:02d}.wav"
@@ -143,6 +184,7 @@ def measure_latency(
     device,
     warmup_runs=1,
     maxlenratio=11.0,
+    threshold=0.40,
 ):
     if not sentences:
         return [], float("nan")
@@ -157,6 +199,7 @@ def measure_latency(
             sentences[0],
             spk,
             device,
+            threshold=threshold,
             maxlenratio=maxlenratio,
         )
 
@@ -171,6 +214,7 @@ def measure_latency(
             text,
             spk,
             device,
+            threshold=threshold,
             maxlenratio=maxlenratio,
         )
         _sync_cuda(device)
