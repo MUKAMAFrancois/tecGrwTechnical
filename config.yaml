@@ -1,35 +1,10 @@
-# DATASET
-
+# Dataset and preprocessing
 HF_DATASET_ID: "Washere-1/tecgrw-audio"
-RAW_DIR: "data/raw"
 PROCESSED_DIR: "data/processed"
 SELECTED_SPEAKER_ID: 1
 TARGET_SAMPLE_RATE: 16000
 
-# MEL SPECTROGRAM
-N_FFT: 1024
-HOP_LENGTH: 256
-N_MELS: 80
-
-# MODEL
-
-MODEL_NAME: "facebook/mms-tts-kin"
-
-# TRAINING
-
-BATCH_SIZE: 8
-NUM_WORKERS: 4
-USE_AMP: true
-
-# Dynamic batching (set to null to use fixed BATCH_SIZE only)
-MAX_BATCH_DURATION_SEC: 40.0
-VAL_MAX_BATCH_DURATION_SEC: 48.0
-
-# Optimizer + scheduler
-WARMUP_STEPS: 500
-COSINE_MIN_LR: 0.000001
-WEIGHT_DECAY: 0.01
-
+# Processed metadata files
 TRAIN_METADATA: "data/processed/metadata_train.csv"
 VAL_METADATA: "data/processed/metadata_validation.csv"
 
@@ -44,32 +19,3 @@ STAGES:
   - stage: 3
     lr: 0.00001
     epochs: 7
-
-# EMA for smoother synthesis
-EMA_ENABLED: true
-EMA_DECAY: 0.9995
-EVAL_USE_EMA: true
-CHECKPOINT_USE_EMA: true
-
-# CHECKPOINTS
-
-CHECKPOINT_DIR: "checkpoints"
-SAVE_EVERY: 2000
-
-# OUTPUT
-
-OUTPUT_DIR: "evaluation/synthesized_wavs"
-
-# EVALUATION
-
-LATENCY_TEST_SENTENCE: "Muraho, nagufasha gute uyu munsi?"
-EVAL_DIR: eval/
-
-# LOGGING
-
-LOG_EVERY: 100
-VALIDATE_EVERY: 500
-
-# DEVICE
-
-DEVICE: "cuda"
