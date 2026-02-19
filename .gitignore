@@ -20,3 +20,15 @@ checkpoints/
 
 # env
 .env
+
+#.pt files
+*.pt
+
+#wav outputs
+wav_outputs/
+
+#fp32
+speecht5_fp32_infer/
+
+#int8
+speecht5_int8_deployment/

@@ -4,11 +4,17 @@ import time
 import warnings
 import zipfile
 from pathlib import Path
-
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning) #
 import numpy as np
 import soundfile as sf
 import torch
-from transformers import SpeechT5ForTextToSpeech, SpeechT5HifiGan, SpeechT5Processor
+from transformers import (
+    SpeechT5Config,
+    SpeechT5ForTextToSpeech,
+    SpeechT5HifiGan,
+    SpeechT5Processor,
+)
 
 
 try:
@@ -47,11 +53,17 @@ def _load_speaker_embedding(path):
 
 def load_int8_model(package_dir):
     pkg = Path(package_dir)
-    base_model = SpeechT5ForTextToSpeech.from_pretrained(str(pkg))
+    state_path = pkg / "model_int8.pt"
+    if not state_path.exists():
+        raise FileNotFoundError(f"INT8 weights not found: {state_path}")
+
+    # INT8 package stores config + quantized state dict; it may not include model.safetensors.
+    config = SpeechT5Config.from_pretrained(str(pkg), local_files_only=True)
+    base_model = SpeechT5ForTextToSpeech(config)
     qmodel = torch.quantization.quantize_dynamic(
         base_model, {torch.nn.Linear}, dtype=torch.qint8
     )
-    state = torch.load(str(pkg / "model_int8.pt"), map_location="cpu")
+    state = torch.load(str(state_path), map_location="cpu")
     qmodel.load_state_dict(state)
     qmodel.cpu().eval()
     return qmodel
@@ -88,8 +100,10 @@ def run_fp32(text, fp32_dir, spk_emb, out_prefix):
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning)
-        processor = SpeechT5Processor.from_pretrained(str(fp32_dir))
-        model = SpeechT5ForTextToSpeech.from_pretrained(str(fp32_dir)).to(device).eval()
+        processor = SpeechT5Processor.from_pretrained(str(fp32_dir), local_files_only=True)
+        model = SpeechT5ForTextToSpeech.from_pretrained(
+            str(fp32_dir), local_files_only=True
+        ).to(device).eval()
         vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan").to(device).eval()
 
     _ = synthesize(model, prepare_inputs(text, processor, device), spk_emb, vocoder, device)
@@ -107,7 +121,7 @@ def run_int8(text, int8_dir, spk_emb, out_prefix):
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning)
-        processor = SpeechT5Processor.from_pretrained(str(int8_dir))
+        processor = SpeechT5Processor.from_pretrained(str(int8_dir), local_files_only=True)
         model = load_int8_model(int8_dir)
         vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan").to(device).eval()
 
