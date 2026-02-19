@@ -1,6 +1,7 @@
 import inspect
 import os
 from dataclasses import dataclass
+from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
@@ -96,8 +97,12 @@ def get_speaker_embedding(train_dataset, device):
         print("Using SpeechBrain speaker embedding:", emb.shape)
         return emb
     except Exception as exc:
-        print("Speaker encoder unavailable, using fixed fallback embedding. Error:", exc)
-        return np.zeros((512,), dtype=np.float32)
+        print("Speaker encoder unavailable. Error:", exc)
+        print("Falling back to 'Matthijs/cmu-arctic-xvectors' (index 7306).")
+        from datasets import load_dataset
+        embeddings_dataset = load_dataset("Matthijs/cmu-arctic-xvectors", split="validation")
+        fallback_emb = torch.tensor(embeddings_dataset[7306]["xvector"]).numpy().astype(np.float32)
+        return fallback_emb
 
 
 def normalize_input_ids(input_ids):
@@ -230,6 +235,29 @@ class TrainerBundle:
     args: Seq2SeqTrainingArguments
     trainer: Seq2SeqTrainer
     output_dir: str
+    stages: List[Dict[str, Any]]
+
+
+def parse_training_stages(config):
+    raw_stages = (config or {}).get("STAGES") or []
+    stages = []
+
+    for idx, raw in enumerate(raw_stages, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"STAGES[{idx - 1}] must be a dict, got: {type(raw)}")
+
+        stage_id = int(raw.get("stage", idx))
+        lr = float(raw["lr"])
+        epochs = float(raw["epochs"])
+
+        if lr <= 0:
+            raise ValueError(f"STAGES[{idx - 1}] has invalid lr={lr}. Must be > 0.")
+        if epochs <= 0:
+            raise ValueError(f"STAGES[{idx - 1}] has invalid epochs={epochs}. Must be > 0.")
+
+        stages.append({"stage": stage_id, "lr": lr, "epochs": epochs})
+
+    return stages
 
 
 def _set_eval_strategy(kwargs, value):
@@ -254,6 +282,7 @@ def build_trainer_bundle(
     train_proc,
     val_proc,
     data_collator,
+    config=None,
     output_dir="speecht5_finetuned",
 ):
     if len(train_proc) == 0:
@@ -263,14 +292,22 @@ def build_trainer_bundle(
             "val_proc is empty. With load_best_model_at_end=True, no eval metrics can be produced."
         )
 
+    stages = parse_training_stages(config)
+    if stages:
+        initial_lr = float(stages[0]["lr"])
+        initial_epochs = float(stages[0]["epochs"])
+    else:
+        initial_lr = 2e-5
+        initial_epochs = 10
+
     base_kwargs = dict(
         output_dir=output_dir,
         per_device_train_batch_size=4,
         per_device_eval_batch_size=4,
         gradient_accumulation_steps=2,
-        learning_rate=2e-5,
+        learning_rate=initial_lr,
         warmup_steps=500,
-        num_train_epochs=10,
+        num_train_epochs=initial_epochs,
         logging_steps=50,
         save_total_limit=2,
         load_best_model_at_end=True,
@@ -307,4 +344,36 @@ def build_trainer_bundle(
     trainer = Seq2SeqTrainer(**trainer_kwargs)
     if not getattr(trainer, "label_names", None):
         trainer.label_names = ["labels"]
-    return TrainerBundle(args=args, trainer=trainer, output_dir=output_dir)
+    return TrainerBundle(args=args, trainer=trainer, output_dir=output_dir, stages=stages)
+
+
+def run_stagewise_training(bundle):
+    trainer = bundle.trainer
+    stages = bundle.stages
+
+    if not stages:
+        print(
+            "No STAGES found in config. Running single training pass with "
+            f"lr={trainer.args.learning_rate}, epochs={trainer.args.num_train_epochs}."
+        )
+        return trainer.train()
+
+    stage_results = []
+    for stage_cfg in stages:
+        stage_id = int(stage_cfg["stage"])
+        stage_lr = float(stage_cfg["lr"])
+        stage_epochs = float(stage_cfg["epochs"])
+
+        trainer.args.learning_rate = stage_lr
+        trainer.args.num_train_epochs = stage_epochs
+
+        # Recreate optimizer/scheduler so each stage starts with its own LR setup.
+        trainer.optimizer = None
+        trainer.lr_scheduler = None
+
+        print(
+            f"\n[Stage {stage_id}] training for {stage_epochs} epochs at lr={stage_lr:.8f}"
+        )
+        stage_results.append(trainer.train())
+
+    return stage_results[-1] if stage_results else None
