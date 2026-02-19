@@ -1,11 +1,14 @@
 ﻿import argparse
+import os
 import re
 import time
 import warnings
 import zipfile
 from pathlib import Path
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=UserWarning) #
+warnings.filterwarnings("ignore", category=UserWarning)
+
 import numpy as np
 import soundfile as sf
 import torch
@@ -27,6 +30,22 @@ except ImportError:
 def _sync_cuda(device):
     if getattr(device, "type", None) == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _configure_runtime(device):
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+    if getattr(device, "type", None) == "cuda":
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends, "cudnn"):
+            if hasattr(torch.backends.cudnn, "allow_tf32"):
+                torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+    else:
+        cpu_threads = max(1, (os.cpu_count() or 2) - 1)
+        torch.set_num_threads(cpu_threads)
 
 
 def _resolve_dir(path_or_zip):
@@ -57,7 +76,7 @@ def load_int8_model(package_dir):
     if not state_path.exists():
         raise FileNotFoundError(f"INT8 weights not found: {state_path}")
 
-    # INT8 package stores config + quantized state dict; it may not include model.safetensors.
+    # INT8 package can include config + quantized weights only (no model.safetensors).
     config = SpeechT5Config.from_pretrained(str(pkg), local_files_only=True)
     base_model = SpeechT5ForTextToSpeech(config)
     qmodel = torch.quantization.quantize_dynamic(
@@ -71,22 +90,26 @@ def load_int8_model(package_dir):
 
 def prepare_inputs(text, processor, device):
     text_cleaned = clean_text(text)
-    padded = "... " + text_cleaned
-    return processor(text=padded, return_tensors="pt").to(device)
+    return processor(text=text_cleaned, return_tensors="pt").to(device)
 
 
 def synthesize(model, inputs, spk_emb, vocoder, device):
     spk = spk_emb.to(device)
     _sync_cuda(device)
     t0 = time.perf_counter()
-    with torch.no_grad():
-        speech = model.generate_speech(
-            inputs["input_ids"],
-            spk,
-            vocoder=vocoder,
-            threshold=0.50,
-            maxlenratio=10.0,
-        )
+
+    use_amp = getattr(device, "type", None) == "cuda"
+    with torch.inference_mode():
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            speech = model.generate_speech(
+                inputs["input_ids"],
+                spk,
+                vocoder=vocoder,
+                threshold=0.58,
+                minlenratio=0.0,
+                maxlenratio=6.8,
+            )
+
     _sync_cuda(device)
     t1 = time.perf_counter()
     latency_ms = (t1 - t0) * 1000.0
@@ -96,6 +119,7 @@ def synthesize(model, inputs, spk_emb, vocoder, device):
 
 def run_fp32(text, fp32_dir, spk_emb, out_prefix):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _configure_runtime(device)
     print(f"\n[FP32] Loading model on {device} from: {fp32_dir}")
 
     with warnings.catch_warnings():
@@ -117,6 +141,7 @@ def run_fp32(text, fp32_dir, spk_emb, out_prefix):
 
 def run_int8(text, int8_dir, spk_emb, out_prefix):
     device = torch.device("cpu")
+    _configure_runtime(device)
     print(f"\n[INT8] Loading model on {device} from: {int8_dir}")
 
     with warnings.catch_warnings():

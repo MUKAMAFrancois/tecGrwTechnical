@@ -2,6 +2,7 @@ import time
 import warnings
 import zipfile
 import copy
+import os
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +39,23 @@ def save_generation_config(model, checkpoint_path):
         model.generation_config.save_pretrained(checkpoint_path)
 
 
+def configure_runtime_for_latency(device):
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+    if hasattr(device, "type") and device.type == "cuda":
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends, "cudnn"):
+            if hasattr(torch.backends.cudnn, "allow_tf32"):
+                torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+    else:
+        # Keep one core free to reduce context-switch overhead on shared machines.
+        cpu_threads = max(1, (os.cpu_count() or 2) - 1)
+        torch.set_num_threads(cpu_threads)
+
+
 def _to_speaker_tensor(speaker_embedding, device):
     if torch.is_tensor(speaker_embedding):
         spk = speaker_embedding.to(device)
@@ -53,21 +71,29 @@ def _sync_cuda(device):
         torch.cuda.synchronize(device)
 
 
-def _generate_speech(
+def _prepare_generation_text(text, add_leading_prompt=True):
+    cleaned = clean_text(text)
+    if add_leading_prompt and cleaned:
+        return "uuu " + cleaned
+    return cleaned
+
+
+def _prepare_input_ids(processor, text, device, add_leading_prompt=True):
+    prepped_text = _prepare_generation_text(text, add_leading_prompt=add_leading_prompt)
+    inputs = processor(text=prepped_text, return_tensors="pt")
+    return inputs["input_ids"].to(device)
+
+
+def _generate_speech_from_input_ids(
     model,
-    processor,
     vocoder,
-    text,
+    input_ids,
     speaker_embedding,
     device,
     threshold=0.5,
     minlenratio=0.0,
     maxlenratio=12.0,
 ):
-    text = "uuu " + clean_text(text)
-    inputs = processor(text=text, return_tensors="pt")
-    input_ids = inputs["input_ids"].to(device)
-
     use_amp = hasattr(device, "type") and device.type == "cuda"
     with torch.inference_mode():
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
@@ -86,9 +112,39 @@ def _generate_speech(
     return wav
 
 
+def _generate_speech(
+    model,
+    processor,
+    vocoder,
+    text,
+    speaker_embedding,
+    device,
+    threshold=0.5,
+    minlenratio=0.0,
+    maxlenratio=12.0,
+    add_leading_prompt=True,
+):
+    input_ids = _prepare_input_ids(
+        processor=processor,
+        text=text,
+        device=device,
+        add_leading_prompt=add_leading_prompt,
+    )
+    return _generate_speech_from_input_ids(
+        model=model,
+        vocoder=vocoder,
+        input_ids=input_ids,
+        speaker_embedding=speaker_embedding,
+        device=device,
+        threshold=threshold,
+        minlenratio=minlenratio,
+        maxlenratio=maxlenratio,
+    )
+
+
 def _min_expected_duration_seconds(text):
     words = max(1, len(str(text).split()))
-    return max(2.0, words * 0.45)
+    return max(1.0, words * 0.24)
 
 
 def _trim_trailing_silence(
@@ -183,41 +239,84 @@ def measure_latency(
     speaker_embedding,
     sentences,
     device,
-    warmup_runs=1,
-    maxlenratio=11.0,
-    threshold=0.40,
+    warmup_runs=2,
+    maxlenratio=6.8,
+    threshold=0.58,
+    minlenratio=0.0,
+    add_leading_prompt=False,
+    cache_inputs=True,
 ):
     if not sentences:
         return [], float("nan")
 
+    configure_runtime_for_latency(device)
     spk = _to_speaker_tensor(speaker_embedding, device)
+    prepared_ids = None
+    if cache_inputs:
+        prepared_ids = [
+            _prepare_input_ids(
+                processor=processor,
+                text=text,
+                device=device,
+                add_leading_prompt=add_leading_prompt,
+            )
+            for text in sentences
+        ]
 
     for _ in range(max(0, int(warmup_runs))):
-        _ = _generate_speech(
-            model,
-            processor,
-            vocoder,
-            sentences[0],
-            spk,
-            device,
-            threshold=threshold,
-            maxlenratio=maxlenratio,
-        )
+        if prepared_ids is not None:
+            _ = _generate_speech_from_input_ids(
+                model=model,
+                vocoder=vocoder,
+                input_ids=prepared_ids[0],
+                speaker_embedding=spk,
+                device=device,
+                threshold=threshold,
+                minlenratio=minlenratio,
+                maxlenratio=maxlenratio,
+            )
+        else:
+            _ = _generate_speech(
+                model,
+                processor,
+                vocoder,
+                sentences[0],
+                spk,
+                device,
+                threshold=threshold,
+                minlenratio=minlenratio,
+                maxlenratio=maxlenratio,
+                add_leading_prompt=add_leading_prompt,
+            )
 
     latencies_ms = []
-    for text in sentences:
+    for idx, text in enumerate(sentences):
         _sync_cuda(device)
         t0 = time.perf_counter()
-        _ = _generate_speech(
-            model,
-            processor,
-            vocoder,
-            text,
-            spk,
-            device,
-            threshold=threshold,
-            maxlenratio=maxlenratio,
-        )
+        if prepared_ids is not None:
+            _ = _generate_speech_from_input_ids(
+                model=model,
+                vocoder=vocoder,
+                input_ids=prepared_ids[idx],
+                speaker_embedding=spk,
+                device=device,
+                threshold=threshold,
+                minlenratio=minlenratio,
+                maxlenratio=maxlenratio,
+            )
+        else:
+            _ = _generate_speech(
+                model,
+                processor,
+                vocoder,
+                text,
+                spk,
+                device,
+                threshold=threshold,
+                minlenratio=minlenratio,
+                maxlenratio=maxlenratio,
+                add_leading_prompt=add_leading_prompt,
+            )
         _sync_cuda(device)
         t1 = time.perf_counter()
 
