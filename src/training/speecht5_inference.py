@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
-from transformers import SpeechT5ForTextToSpeech
+from transformers import SpeechT5Config, SpeechT5ForTextToSpeech
 
 from src.preprocess import clean_text
 
@@ -51,7 +51,6 @@ def configure_runtime_for_latency(device):
                 torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
     else:
-        # Keep one core free to reduce context-switch overhead on shared machines.
         cpu_threads = max(1, (os.cpu_count() or 2) - 1)
         torch.set_num_threads(cpu_threads)
 
@@ -171,6 +170,18 @@ def _trim_trailing_silence(
     return wav[:end]
 
 
+def _sanitize_wav_for_export(wav):
+    arr = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return arr
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    peak = float(np.max(np.abs(arr)))
+    if peak > 1.0:
+        arr = arr / peak
+    arr = np.clip(arr, -1.0, 1.0)
+    return arr.astype(np.float32, copy=False)
+
+
 def synthesize_test_sentences(
     model,
     processor,
@@ -226,7 +237,9 @@ def synthesize_test_sentences(
             )
 
         out_path = out_dir / f"sentence_{idx:02d}.wav"
-        sf.write(str(out_path), wav, sample_rate)
+        wav = _sanitize_wav_for_export(wav)
+        # PCM_16 improves compatibility with modern Windows Media Player.
+        sf.write(str(out_path), wav, sample_rate, subtype="PCM_16")
         output_paths.append(out_path)
 
     return output_paths
@@ -240,14 +253,18 @@ def measure_latency(
     sentences,
     device,
     warmup_runs=2,
-    maxlenratio=6.8,
-    threshold=0.58,
-    minlenratio=0.0,
+    maxlenratio=None,
+    threshold=None,
+    minlenratio=None,
     add_leading_prompt=False,
     cache_inputs=True,
 ):
     if not sentences:
         return [], float("nan")
+
+    maxlenratio = float(6.8 if maxlenratio is None else maxlenratio)
+    threshold = float(0.58 if threshold is None else threshold)
+    minlenratio = float(0.0 if minlenratio is None else minlenratio)
 
     configure_runtime_for_latency(device)
     spk = _to_speaker_tensor(speaker_embedding, device)
@@ -385,11 +402,17 @@ def export_int8_deployment_package(model, processor, output_dir):
 def load_int8_model(package_dir, device="cpu"):
     """Load an INT8 deployment package for inference."""
     pkg = Path(package_dir)
-    base_model = SpeechT5ForTextToSpeech.from_pretrained(str(pkg))
+    state_path = pkg / "model_int8.pt"
+    if not state_path.exists():
+        raise FileNotFoundError(f"INT8 weights not found: {state_path}")
+
+    # INT8 package may include config + quantized weights only.
+    config = SpeechT5Config.from_pretrained(str(pkg), local_files_only=True)
+    base_model = SpeechT5ForTextToSpeech(config)
     qmodel = torch.quantization.quantize_dynamic(
         base_model, {torch.nn.Linear}, dtype=torch.qint8
     )
-    state = torch.load(str(pkg / "model_int8.pt"), map_location="cpu")
+    state = torch.load(str(state_path), map_location="cpu")
     qmodel.load_state_dict(state)
     qmodel.to(device).eval()
     return qmodel

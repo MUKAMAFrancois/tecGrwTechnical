@@ -1,0 +1,9 @@
+fastapi>=0.110
+uvicorn[standard]>=0.30
+numpy>=1.26
+soundfile>=0.12
+sentencepiece>=0.1.99
+safetensors>=0.4
+transformers>=4.56,<5
+torch
+torchaudio

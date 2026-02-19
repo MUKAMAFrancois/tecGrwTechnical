@@ -1,0 +1,17 @@
+services:
+  tts-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: technical-tts
+    ports:
+      - "8000:8000"
+    environment:
+      TTS_FP32_DIR: /models/speecht5_fp32_infer
+      TTS_INT8_DIR: /models/speecht5_int8_deployment
+      TTS_SPEAKER_PATH: /models/speaker_embedding.pt
+      TTS_DEVICE: auto
+    volumes:
+      - ./speecht5_fp32_infer:/models/speecht5_fp32_infer:ro
+      - ./speecht5_int8_deployment:/models/speecht5_int8_deployment:ro
+      - ./speaker_embedding.pt:/models/speaker_embedding.pt:ro

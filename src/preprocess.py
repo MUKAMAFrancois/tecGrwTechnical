@@ -25,7 +25,6 @@ def is_valid_duration(duration_sec, min_sec=1.0, max_sec=15.0):
 
 def trim_silence(audio_tensor, sample_rate):
 
-    # torchaudio VAD expects CPU tensor
     audio_tensor = audio_tensor.cpu()
 
     trimmed = torchaudio.functional.vad(
@@ -33,7 +32,6 @@ def trim_silence(audio_tensor, sample_rate):
         sample_rate=sample_rate
     )
 
-    # fallback if trimming removes everything
     if trimmed.numel() == 0:
         return audio_tensor
 
@@ -115,7 +113,7 @@ def clean_text(text):
     # Expand digits to Kinyarwanda words
     text = re.sub(r"\d+", _expand_number, text)
 
-    # Remove non-speech characters (keep letters, spaces, apostrophes, hyphens)
+    # Remove non-speech characters
     text = re.sub(r"[^\w\s'\-']", "", text)
 
     text = " ".join(text.split())

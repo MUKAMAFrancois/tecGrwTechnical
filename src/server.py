@@ -1,0 +1,233 @@
+import io
+import os
+import re
+import time
+from pathlib import Path
+from typing import Literal
+
+import numpy as np
+import soundfile as sf
+import torch
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
+from transformers import (
+    SpeechT5Config,
+    SpeechT5ForTextToSpeech,
+    SpeechT5HifiGan,
+    SpeechT5Processor,
+)
+
+try:
+    from src.preprocess import clean_text
+except Exception:
+    def clean_text(text):
+        return re.sub(r"[^\w\s'\-]", "", str(text).strip())
+
+
+class SynthesizeRequest(BaseModel):
+    text: str
+    mode: Literal["fp32", "int8"] = "fp32"
+
+
+def _sanitize_wav_for_export(wav):
+    arr = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return arr
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    peak = float(np.max(np.abs(arr)))
+    if peak > 1.0:
+        arr = arr / peak
+    arr = np.clip(arr, -1.0, 1.0)
+    return arr.astype(np.float32, copy=False)
+
+
+class TTSRuntime:
+    def __init__(self):
+        self.fp32_dir = Path(os.getenv("TTS_FP32_DIR", "/models/speecht5_fp32_infer"))
+        self.int8_dir = Path(os.getenv("TTS_INT8_DIR", "/models/speecht5_int8_deployment"))
+        self.speaker_path = Path(os.getenv("TTS_SPEAKER_PATH", "/models/speaker_embedding.pt"))
+        self.vocoder_id = os.getenv("TTS_VOCODER_ID", "microsoft/speecht5_hifigan")
+        self.sample_rate = int(os.getenv("TTS_SAMPLE_RATE", "16000"))
+        self.device = self._resolve_device(os.getenv("TTS_DEVICE", "auto"))
+
+        self._speaker_embedding = None
+        self._vocoder_by_device = {}
+
+        self._processor_fp32 = None
+        self._model_fp32 = None
+
+        self._processor_int8 = None
+        self._model_int8 = None
+
+        self._configure_runtime(self.device)
+
+    def _resolve_device(self, raw_device):
+        raw = str(raw_device).strip().lower()
+        if raw == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(raw)
+
+    def _configure_runtime(self, device):
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+
+        if getattr(device, "type", None) == "cuda":
+            if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            if hasattr(torch.backends, "cudnn"):
+                if hasattr(torch.backends.cudnn, "allow_tf32"):
+                    torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cudnn.benchmark = True
+        else:
+            cpu_threads = max(1, (os.cpu_count() or 2) - 1)
+            torch.set_num_threads(cpu_threads)
+
+    def _sync_cuda(self, device):
+        if getattr(device, "type", None) == "cuda":
+            torch.cuda.synchronize(device)
+
+    def _get_speaker_embedding(self):
+        if self._speaker_embedding is not None:
+            return self._speaker_embedding
+
+        if not self.speaker_path.exists():
+            raise FileNotFoundError(f"Speaker embedding not found: {self.speaker_path}")
+
+        spk = torch.load(str(self.speaker_path), map_location="cpu")
+        if not torch.is_tensor(spk):
+            spk = torch.tensor(spk, dtype=torch.float32)
+        if spk.dim() == 1:
+            spk = spk.unsqueeze(0)
+        self._speaker_embedding = spk.float()
+        return self._speaker_embedding
+
+    def _get_vocoder(self, device):
+        key = str(device)
+        if key in self._vocoder_by_device:
+            return self._vocoder_by_device[key]
+
+        vocoder = SpeechT5HifiGan.from_pretrained(self.vocoder_id).to(device).eval()
+        self._vocoder_by_device[key] = vocoder
+        return vocoder
+
+    def _ensure_fp32_bundle(self):
+        if self._processor_fp32 is not None and self._model_fp32 is not None:
+            return self._processor_fp32, self._model_fp32
+
+        if not self.fp32_dir.exists():
+            raise FileNotFoundError(f"FP32 model directory not found: {self.fp32_dir}")
+
+        self._processor_fp32 = SpeechT5Processor.from_pretrained(
+            str(self.fp32_dir), local_files_only=True
+        )
+        self._model_fp32 = SpeechT5ForTextToSpeech.from_pretrained(
+            str(self.fp32_dir), local_files_only=True
+        ).to(self.device).eval()
+        return self._processor_fp32, self._model_fp32
+
+    def _load_int8_model(self):
+        state_path = self.int8_dir / "model_int8.pt"
+        if not state_path.exists():
+            raise FileNotFoundError(f"INT8 weights not found: {state_path}")
+
+        config = SpeechT5Config.from_pretrained(str(self.int8_dir), local_files_only=True)
+        base_model = SpeechT5ForTextToSpeech(config)
+        qmodel = torch.quantization.quantize_dynamic(
+            base_model, {torch.nn.Linear}, dtype=torch.qint8
+        )
+        state = torch.load(str(state_path), map_location="cpu")
+        qmodel.load_state_dict(state)
+        qmodel.cpu().eval()
+        return qmodel
+
+    def _ensure_int8_bundle(self):
+        if self._processor_int8 is not None and self._model_int8 is not None:
+            return self._processor_int8, self._model_int8
+
+        if not self.int8_dir.exists():
+            raise FileNotFoundError(f"INT8 model directory not found: {self.int8_dir}")
+
+        self._processor_int8 = SpeechT5Processor.from_pretrained(
+            str(self.int8_dir), local_files_only=True
+        )
+        self._model_int8 = self._load_int8_model()
+        return self._processor_int8, self._model_int8
+
+    def synthesize(self, text, mode):
+        if not str(text).strip():
+            raise ValueError("Input text is empty.")
+
+        cleaned = clean_text(text)
+        if not cleaned:
+            raise ValueError("Input text becomes empty after cleaning.")
+
+        if mode == "fp32":
+            processor, model = self._ensure_fp32_bundle()
+            device = self.device
+        elif mode == "int8":
+            processor, model = self._ensure_int8_bundle()
+            device = torch.device("cpu")
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
+
+        vocoder = self._get_vocoder(device)
+        speaker_embedding = self._get_speaker_embedding().to(device)
+        inputs = processor(text=cleaned, return_tensors="pt")
+        input_ids = inputs["input_ids"].to(device)
+
+        self._sync_cuda(device)
+        t0 = time.perf_counter()
+        use_amp = getattr(device, "type", None) == "cuda"
+        with torch.inference_mode():
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                speech = model.generate_speech(
+                    input_ids,
+                    speaker_embedding,
+                    vocoder=vocoder,
+                    threshold=0.58,
+                    minlenratio=0.0,
+                    maxlenratio=6.8,
+                )
+        self._sync_cuda(device)
+        t1 = time.perf_counter()
+
+        wav = speech.detach().cpu().numpy().astype(np.float32).reshape(-1)
+        wav = _sanitize_wav_for_export(wav)
+        return wav, self.sample_rate, (t1 - t0) * 1000.0
+
+    def health(self):
+        return {
+            "status": "ok",
+            "device": str(self.device),
+            "fp32_dir_exists": self.fp32_dir.exists(),
+            "int8_dir_exists": self.int8_dir.exists(),
+            "speaker_exists": self.speaker_path.exists(),
+        }
+
+
+app = FastAPI(title="TechnicalTTS API", version="1.0.0")
+runtime = TTSRuntime()
+
+
+@app.get("/health")
+def health():
+    return JSONResponse(runtime.health())
+
+
+@app.post("/synthesize")
+def synthesize(request: SynthesizeRequest):
+    try:
+        wav, sr, latency_ms = runtime.synthesize(request.text, request.mode)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    buffer = io.BytesIO()
+    sf.write(buffer, wav, sr, format="WAV", subtype="PCM_16")
+    buffer.seek(0)
+
+    headers = {
+        "X-TTS-Mode": request.mode,
+        "X-TTS-Latency-Ms": f"{latency_ms:.2f}",
+    }
+    return StreamingResponse(buffer, media_type="audio/wav", headers=headers)

@@ -12,10 +12,10 @@ VAL_METADATA: "data/processed/metadata_validation.csv"
 STAGES:
   - stage: 1
     lr: 0.00010
-    epochs: 10
+    epochs: 5
   - stage: 2
     lr: 0.00003
-    epochs: 8
+    epochs: 4
   - stage: 3
     lr: 0.00001
-    epochs: 7
+    epochs: 3

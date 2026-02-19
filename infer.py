@@ -70,13 +70,24 @@ def _load_speaker_embedding(path):
     return spk.float()
 
 
+def _sanitize_wav_for_export(wav):
+    arr = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return arr
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    peak = float(np.max(np.abs(arr)))
+    if peak > 1.0:
+        arr = arr / peak
+    arr = np.clip(arr, -1.0, 1.0)
+    return arr.astype(np.float32, copy=False)
+
+
 def load_int8_model(package_dir):
     pkg = Path(package_dir)
     state_path = pkg / "model_int8.pt"
     if not state_path.exists():
         raise FileNotFoundError(f"INT8 weights not found: {state_path}")
 
-    # INT8 package can include config + quantized weights only (no model.safetensors).
     config = SpeechT5Config.from_pretrained(str(pkg), local_files_only=True)
     base_model = SpeechT5ForTextToSpeech(config)
     qmodel = torch.quantization.quantize_dynamic(
@@ -130,11 +141,13 @@ def run_fp32(text, fp32_dir, spk_emb, out_prefix):
         ).to(device).eval()
         vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan").to(device).eval()
 
-    _ = synthesize(model, prepare_inputs(text, processor, device), spk_emb, vocoder, device)
-    wav, latency = synthesize(model, prepare_inputs(text, processor, device), spk_emb, vocoder, device)
+    inputs = prepare_inputs(text, processor, device)
+    _ = synthesize(model, inputs, spk_emb, vocoder, device)
+    wav, latency = synthesize(model, inputs, spk_emb, vocoder, device)
 
     out_path = Path(f"{out_prefix}_fp32.wav")
-    sf.write(str(out_path), wav, 16000)
+    wav = _sanitize_wav_for_export(wav)
+    sf.write(str(out_path), wav, 16000, subtype="PCM_16")
 
     return {"path": out_path, "latency": latency, "device": device}
 
@@ -150,11 +163,13 @@ def run_int8(text, int8_dir, spk_emb, out_prefix):
         model = load_int8_model(int8_dir)
         vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan").to(device).eval()
 
-    _ = synthesize(model, prepare_inputs(text, processor, device), spk_emb, vocoder, device)
-    wav, latency = synthesize(model, prepare_inputs(text, processor, device), spk_emb, vocoder, device)
+    inputs = prepare_inputs(text, processor, device)
+    _ = synthesize(model, inputs, spk_emb, vocoder, device)
+    wav, latency = synthesize(model, inputs, spk_emb, vocoder, device)
 
     out_path = Path(f"{out_prefix}_int8.wav")
-    sf.write(str(out_path), wav, 16000)
+    wav = _sanitize_wav_for_export(wav)
+    sf.write(str(out_path), wav, 16000, subtype="PCM_16")
 
     return {"path": out_path, "latency": latency, "device": device}
 

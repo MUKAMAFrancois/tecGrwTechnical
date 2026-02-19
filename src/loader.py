@@ -9,8 +9,6 @@ from datasets import load_dataset, Audio,concatenate_datasets
 def load_config(config_path=None):
     """
     Load YAML config file.
-
-    If config_path is None, resolves to project root config.yaml.
     """
 
     if config_path is None:
@@ -26,15 +24,8 @@ def load_config(config_path=None):
 
 def get_hf_token():
     """
-    Get HuggingFace token automatically.
-
-    Priority:
-        1. Google Colab secrets (key: HF_TOKEN)
-        2. Environment variable HF_TOKEN
-        3. Manual prompt (getpass)
+    Get HuggingFace token.
     """
-
-    # 1. Try Google Colab secrets
     try:
         from google.colab import userdata
         token = userdata.get("HF_TOKEN")
@@ -44,13 +35,11 @@ def get_hf_token():
     except (ImportError, ModuleNotFoundError, Exception):
         pass
 
-    # 2. Try environment variable
     token = os.environ.get("HF_TOKEN")
     if token:
         print("Using HF token from environment variable")
         return token
 
-    # 3. Fall back to manual prompt
     return getpass.getpass("Enter HuggingFace token: ")
 
 
@@ -146,10 +135,8 @@ def filter_speaker(dataset_split, speaker_id):
     """
     df = dataset_split.to_pandas()
     
-    # Ensure ID format consistency
     df["speaker_id"] = df["speaker_id"].astype(int)
     
-    # Filter
     df_filtered = df[df["speaker_id"] == int(speaker_id)].reset_index(drop=True)
     return df_filtered
 

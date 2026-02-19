@@ -1,0 +1,17 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+data
+checkpoints
+wav_outputs
+pretrained_spkrec
+
+speecht5_fp32_infer
+speecht5_int8_deployment
+speaker_embedding.pt
+
+main.ipynb

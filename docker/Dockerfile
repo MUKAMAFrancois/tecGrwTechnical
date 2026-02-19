@@ -1,21 +1,23 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# System dependencies for audio I/O and inference.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends libsndfile1 ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python deps
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir fastapi uvicorn
+# Install Docker-specific runtime dependencies.
+COPY docker/requirements.docker.txt /tmp/requirements.docker.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.docker.txt
 
-# Copy project
+# Copy project code.
 COPY src/ src/
-COPY config.yaml .
-COPY checkpoints/final/ checkpoints/final/
+COPY infer.py infer.py
+COPY config.yaml config.yaml
 
 EXPOSE 8000
 

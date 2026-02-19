@@ -9,9 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-#MD files
-*.md
-
 # data
 data/
 
