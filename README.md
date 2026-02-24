@@ -36,6 +36,13 @@ Extract the model zip files (or pass zip paths directly), then run:
 python infer.py --text "Muraho, nagufasha gute uyu munsi?" --mode both --out demo
 ```
 
+INT8 strategy options:
+
+```bash
+# default: auto (runtime attention-only quantization from fp32 dir when available)
+python infer.py --text "Muraho, nagufasha gute uyu munsi?" --mode int8 --int8_strategy auto --out demo
+```
+
 Output WAVs are written to `wav_outputs/`:
 
 - `wav_outputs/demo_fp32.wav`
@@ -86,6 +93,7 @@ Docker expects local artifacts mounted by `docker-compose.yml`:
         $env:TTS_FP32_DIR = (Resolve-Path .\speecht5_fp32_infer).Path
         $env:TTS_INT8_DIR = (Resolve-Path .\speecht5_int8_deployment).Path
         $env:TTS_SPEAKER_PATH = (Resolve-Path .\speaker_embedding.pt).Path
+        $env:TTS_INT8_STRATEGY = "auto"
 - run the command to launc the uvicorn server.
         uv run --active python -m uvicorn src.server:app --host 127.0.0.1 --port 8000
 

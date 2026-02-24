@@ -1,4 +1,5 @@
 ﻿import argparse
+import json
 import os
 import re
 import time
@@ -18,6 +19,8 @@ from transformers import (
     SpeechT5HifiGan,
     SpeechT5Processor,
 )
+
+INT8_META_FILE = "int8_quantization.json"
 
 
 try:
@@ -70,33 +73,118 @@ def _load_speaker_embedding(path):
     return spk.float()
 
 
-def _sanitize_wav_for_export(wav):
+def _sanitize_wav_for_export(wav, target_peak=0.85, min_peak=1e-4, max_gain=12.0):
     arr = np.asarray(wav, dtype=np.float32).reshape(-1)
     if arr.size == 0:
         return arr
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
     peak = float(np.max(np.abs(arr)))
+    if peak <= 0.0:
+        return arr.astype(np.float32, copy=False)
     if peak > 1.0:
         arr = arr / peak
+        peak = 1.0
+    if min_peak < peak < target_peak:
+        gain = min(target_peak / peak, max_gain)
+        arr = arr * gain
     arr = np.clip(arr, -1.0, 1.0)
     return arr.astype(np.float32, copy=False)
 
 
-def load_int8_model(package_dir):
+def _int8_qconfig_spec(model, scheme):
+    normalized = str(scheme).strip().lower()
+    if normalized == "all_linear":
+        return {torch.nn.Linear}
+    if normalized == "attention_only":
+        linear_names = [
+            name for name, module in model.named_modules() if isinstance(module, torch.nn.Linear)
+        ]
+        selected = {
+            name
+            for name in linear_names
+            if (".attention." in name) or (".self_attn." in name) or (".encoder_attn." in name)
+        }
+        if not selected:
+            raise RuntimeError("No attention linear modules found for INT8 quantization.")
+        return selected
+    raise ValueError(f"Unsupported INT8 quantization scheme: {scheme}")
+
+
+def _quantize_dynamic_speecht5(model, scheme):
+    qconfig_spec = _int8_qconfig_spec(model, scheme)
+    qmodel = torch.quantization.quantize_dynamic(
+        model,
+        qconfig_spec=qconfig_spec,
+        dtype=torch.qint8,
+    )
+    return qmodel.cpu().eval()
+
+
+def _load_int8_model_from_package(package_dir):
     pkg = Path(package_dir)
     state_path = pkg / "model_int8.pt"
     if not state_path.exists():
         raise FileNotFoundError(f"INT8 weights not found: {state_path}")
 
-    config = SpeechT5Config.from_pretrained(str(pkg), local_files_only=True)
-    base_model = SpeechT5ForTextToSpeech(config)
-    qmodel = torch.quantization.quantize_dynamic(
-        base_model, {torch.nn.Linear}, dtype=torch.qint8
-    )
     state = torch.load(str(state_path), map_location="cpu")
-    qmodel.load_state_dict(state)
-    qmodel.cpu().eval()
-    return qmodel
+    schemes = ["attention_only", "all_linear"]
+    meta_path = pkg / INT8_META_FILE
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            declared = str(meta.get("scheme", "")).strip().lower()
+            if declared in schemes:
+                schemes = [declared] + [s for s in schemes if s != declared]
+        except Exception:
+            pass
+
+    errors = []
+    for scheme in schemes:
+        try:
+            config = SpeechT5Config.from_pretrained(str(pkg), local_files_only=True)
+            base_model = SpeechT5ForTextToSpeech(config)
+            qmodel = _quantize_dynamic_speecht5(base_model, scheme)
+            qmodel.load_state_dict(state)
+            return qmodel, f"package_{scheme}"
+        except Exception as exc:
+            errors.append(f"{scheme}: {exc}")
+
+    raise RuntimeError(
+        "Unable to load INT8 package with supported schemes. " + " | ".join(errors)
+    )
+
+
+def _build_runtime_int8_from_fp32(fp32_dir, scheme="attention_only"):
+    base_model = SpeechT5ForTextToSpeech.from_pretrained(
+        str(fp32_dir),
+        local_files_only=True,
+    ).cpu().eval()
+    return _quantize_dynamic_speecht5(base_model, scheme)
+
+
+def load_int8_model(package_dir, fp32_dir=None, strategy="auto"):
+    normalized = str(strategy).strip().lower()
+    if normalized not in {"auto", "runtime", "package"}:
+        normalized = "auto"
+
+    runtime_error = None
+    if normalized in {"auto", "runtime"} and fp32_dir is not None:
+        try:
+            return _build_runtime_int8_from_fp32(fp32_dir), "runtime_attention_only"
+        except Exception as exc:
+            runtime_error = exc
+            if normalized == "runtime":
+                raise
+
+    try:
+        return _load_int8_model_from_package(package_dir)
+    except Exception as package_exc:
+        if runtime_error is not None:
+            raise RuntimeError(
+                f"INT8 runtime build failed: {runtime_error} ; "
+                f"INT8 package load failed: {package_exc}"
+            )
+        raise
 
 
 def prepare_inputs(text, processor, device):
@@ -152,15 +240,20 @@ def run_fp32(text, fp32_dir, spk_emb, out_prefix):
     return {"path": out_path, "latency": latency, "device": device}
 
 
-def run_int8(text, int8_dir, spk_emb, out_prefix):
+def run_int8(text, int8_dir, spk_emb, out_prefix, fp32_dir=None, int8_strategy="auto"):
     device = torch.device("cpu")
     _configure_runtime(device)
     print(f"\n[INT8] Loading model on {device} from: {int8_dir}")
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning)
-        processor = SpeechT5Processor.from_pretrained(str(int8_dir), local_files_only=True)
-        model = load_int8_model(int8_dir)
+        model, model_source = load_int8_model(
+            int8_dir,
+            fp32_dir=fp32_dir,
+            strategy=int8_strategy,
+        )
+        processor_dir = fp32_dir if str(model_source).startswith("runtime_") and fp32_dir else int8_dir
+        processor = SpeechT5Processor.from_pretrained(str(processor_dir), local_files_only=True)
         vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan").to(device).eval()
 
     inputs = prepare_inputs(text, processor, device)
@@ -171,7 +264,12 @@ def run_int8(text, int8_dir, spk_emb, out_prefix):
     wav = _sanitize_wav_for_export(wav)
     sf.write(str(out_path), wav, 16000, subtype="PCM_16")
 
-    return {"path": out_path, "latency": latency, "device": device}
+    return {
+        "path": out_path,
+        "latency": latency,
+        "device": device,
+        "model_source": model_source,
+    }
 
 
 def main():
@@ -188,6 +286,15 @@ def main():
         default="speecht5_int8_deployment",
         help="INT8 package dir or zip (contains model_int8.pt + config/tokenizer files).",
     )
+    parser.add_argument(
+        "--int8_strategy",
+        default="auto",
+        choices=["auto", "runtime", "package"],
+        help=(
+            "auto: build INT8 from FP32 when FP32 dir is available, else use package; "
+            "runtime: always build from FP32; package: always load model_int8.pt package."
+        ),
+    )
     parser.add_argument("--mode", default="both", choices=["fp32", "int8", "both"])
     parser.add_argument("--out", default="output", help="Output file prefix")
     args = parser.parse_args()
@@ -202,17 +309,37 @@ def main():
 
     results = {}
 
+    fp32_dir = None
+    if args.mode in ("fp32", "both") or args.int8_strategy in ("auto", "runtime"):
+        try:
+            fp32_dir = _resolve_dir(args.fp32_dir)
+        except Exception:
+            if args.mode in ("fp32", "both"):
+                raise
+            fp32_dir = None
+
     if args.mode in ("fp32", "both"):
-        fp32_dir = _resolve_dir(args.fp32_dir)
+        if fp32_dir is None:
+            fp32_dir = _resolve_dir(args.fp32_dir)
         results["FP32"] = run_fp32(args.text, fp32_dir, spk_emb, str(out_prefix))
         r = results["FP32"]
         print(f"[FP32] Saved: {r['path']} | Latency: {r['latency']:.2f} ms | Device: {r['device']}")
 
     if args.mode in ("int8", "both"):
         int8_dir = _resolve_dir(args.int8_dir)
-        results["INT8"] = run_int8(args.text, int8_dir, spk_emb, str(out_prefix))
+        results["INT8"] = run_int8(
+            args.text,
+            int8_dir,
+            spk_emb,
+            str(out_prefix),
+            fp32_dir=fp32_dir,
+            int8_strategy=args.int8_strategy,
+        )
         r = results["INT8"]
-        print(f"[INT8] Saved: {r['path']} | Latency: {r['latency']:.2f} ms | Device: {r['device']}")
+        print(
+            f"[INT8] Saved: {r['path']} | Latency: {r['latency']:.2f} ms | "
+            f"Device: {r['device']} | Source: {r['model_source']}"
+        )
 
     if args.mode == "both" and len(results) == 2:
         fp = results["FP32"]["latency"]

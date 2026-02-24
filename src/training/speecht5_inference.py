@@ -2,6 +2,7 @@ import time
 import warnings
 import zipfile
 import copy
+import json
 import os
 from pathlib import Path
 
@@ -11,6 +12,8 @@ import torch
 from transformers import SpeechT5Config, SpeechT5ForTextToSpeech
 
 from src.preprocess import clean_text
+
+INT8_META_FILE = "int8_quantization.json"
 
 
 def load_finetuned_model(checkpoint_path, device):
@@ -170,16 +173,51 @@ def _trim_trailing_silence(
     return wav[:end]
 
 
-def _sanitize_wav_for_export(wav):
+def _sanitize_wav_for_export(wav, target_peak=0.85, min_peak=1e-4, max_gain=12.0):
     arr = np.asarray(wav, dtype=np.float32).reshape(-1)
     if arr.size == 0:
         return arr
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
     peak = float(np.max(np.abs(arr)))
+    if peak <= 0.0:
+        return arr.astype(np.float32, copy=False)
     if peak > 1.0:
         arr = arr / peak
+        peak = 1.0
+    if min_peak < peak < target_peak:
+        gain = min(target_peak / peak, max_gain)
+        arr = arr * gain
     arr = np.clip(arr, -1.0, 1.0)
     return arr.astype(np.float32, copy=False)
+
+
+def _int8_qconfig_spec(model, scheme):
+    normalized = str(scheme).strip().lower()
+    if normalized == "all_linear":
+        return {torch.nn.Linear}
+    if normalized == "attention_only":
+        linear_names = [
+            name for name, module in model.named_modules() if isinstance(module, torch.nn.Linear)
+        ]
+        selected = {
+            name
+            for name in linear_names
+            if (".attention." in name) or (".self_attn." in name) or (".encoder_attn." in name)
+        }
+        if not selected:
+            raise RuntimeError("No attention linear modules found for INT8 quantization.")
+        return selected
+    raise ValueError(f"Unsupported INT8 quantization scheme: {scheme}")
+
+
+def _quantize_dynamic_speecht5(model, scheme):
+    qconfig_spec = _int8_qconfig_spec(model, scheme)
+    qmodel = torch.quantization.quantize_dynamic(
+        model,
+        qconfig_spec=qconfig_spec,
+        dtype=torch.qint8,
+    )
+    return qmodel.cpu().eval()
 
 
 def synthesize_test_sentences(
@@ -388,14 +426,16 @@ def export_int8_deployment_package(model, processor, output_dir):
     if hasattr(model, "generation_config") and model.generation_config is not None:
         model.generation_config.save_pretrained(str(out_dir))
 
-    # Quantize and save INT8 state dict
+    # Quantize and save INT8 state dict.
+    # Attention-only quantization preserves intelligibility better for SpeechT5.
+    scheme = "attention_only"
     base_model = copy.deepcopy(model).cpu().eval()
-    qmodel = torch.quantization.quantize_dynamic(
-        base_model,
-        {torch.nn.Linear},
-        dtype=torch.qint8,
-    )
+    qmodel = _quantize_dynamic_speecht5(base_model, scheme)
     torch.save(qmodel.state_dict(), str(out_dir / "model_int8.pt"))
+    (out_dir / INT8_META_FILE).write_text(
+        json.dumps({"scheme": scheme}, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
     return out_dir
 
 
@@ -406,16 +446,31 @@ def load_int8_model(package_dir, device="cpu"):
     if not state_path.exists():
         raise FileNotFoundError(f"INT8 weights not found: {state_path}")
 
-    # INT8 package may include config + quantized weights only.
-    config = SpeechT5Config.from_pretrained(str(pkg), local_files_only=True)
-    base_model = SpeechT5ForTextToSpeech(config)
-    qmodel = torch.quantization.quantize_dynamic(
-        base_model, {torch.nn.Linear}, dtype=torch.qint8
-    )
     state = torch.load(str(state_path), map_location="cpu")
-    qmodel.load_state_dict(state)
-    qmodel.to(device).eval()
-    return qmodel
+    schemes = ["attention_only", "all_linear"]
+    meta_path = pkg / INT8_META_FILE
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            declared = str(meta.get("scheme", "")).strip().lower()
+            if declared in schemes:
+                schemes = [declared] + [s for s in schemes if s != declared]
+        except Exception:
+            pass
+
+    errors = []
+    for scheme in schemes:
+        try:
+            config = SpeechT5Config.from_pretrained(str(pkg), local_files_only=True)
+            base_model = SpeechT5ForTextToSpeech(config)
+            qmodel = _quantize_dynamic_speecht5(base_model, scheme)
+            qmodel.load_state_dict(state)
+            qmodel.to(device).eval()
+            return qmodel
+        except Exception as exc:
+            errors.append(f"{scheme}: {exc}")
+
+    raise RuntimeError("Unable to load INT8 model package. " + " | ".join(errors))
 
 
 def get_directory_size_mb(path):
