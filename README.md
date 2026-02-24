@@ -43,6 +43,7 @@ INT8 strategy options:
 python infer.py --text "Muraho, nagufasha gute uyu munsi?" --mode int8 --int8_strategy auto --out demo
 ```
 
+
 Output WAVs are written to `wav_outputs/`:
 
 - `wav_outputs/demo_fp32.wav`

@@ -51,6 +51,47 @@ def _sanitize_wav_for_export(wav, target_peak=0.85, min_peak=1e-4, max_gain=12.0
     return arr.astype(np.float32, copy=False)
 
 
+def _trim_trailing_silence(wav, sample_rate=16000):
+    arr = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return arr
+
+    sr = int(sample_rate)
+    frame = max(1, int(0.020 * sr))  # 20 ms window
+    hop = max(1, int(0.010 * sr))    # 10 ms hop
+    if arr.size <= frame:
+        return arr
+
+    rms = []
+    for start in range(0, arr.size - frame + 1, hop):
+        chunk = arr[start:start + frame]
+        rms.append(float(np.sqrt(np.mean(chunk * chunk))))
+    if not rms:
+        return arr
+
+    rms = np.asarray(rms, dtype=np.float32)
+    smooth = np.convolve(rms, np.ones(5, dtype=np.float32) / 5.0, mode="same")
+    peak_rms = float(np.max(smooth))
+    if peak_rms <= 1e-8:
+        return arr
+
+    # Use a conservative floor estimate so low-energy final phonemes are preserved.
+    noise_floor = float(np.percentile(smooth, 5))
+    threshold = max(noise_floor * 1.8, peak_rms * 0.03)
+    voiced = np.where(smooth > threshold)[0]
+    if voiced.size == 0:
+        return arr
+
+    last_voiced = int(voiced[-1])
+    trailing_silence_sec = (len(smooth) - 1 - last_voiced) * hop / float(sr)
+    if trailing_silence_sec < 0.30:
+        return arr
+
+    keep_tail = int(0.100 * sr)  # keep 100 ms to avoid abrupt cutoff
+    end = min(int(arr.size), last_voiced * hop + frame + keep_tail)
+    return arr[:end]
+
+
 def _int8_qconfig_spec(model, scheme):
     normalized = str(scheme).strip().lower()
     if normalized == "all_linear":
@@ -275,6 +316,7 @@ class TTSRuntime:
         t1 = time.perf_counter()
 
         wav = speech.detach().cpu().numpy().astype(np.float32).reshape(-1)
+        wav = _trim_trailing_silence(wav, sample_rate=self.sample_rate)
         wav = _sanitize_wav_for_export(wav)
         return wav, self.sample_rate, (t1 - t0) * 1000.0
 

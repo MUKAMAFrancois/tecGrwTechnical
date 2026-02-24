@@ -91,6 +91,47 @@ def _sanitize_wav_for_export(wav, target_peak=0.85, min_peak=1e-4, max_gain=12.0
     return arr.astype(np.float32, copy=False)
 
 
+def _trim_trailing_silence(wav, sample_rate=16000):
+    arr = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return arr
+
+    sr = int(sample_rate)
+    frame = max(1, int(0.020 * sr))  # 20 ms window
+    hop = max(1, int(0.010 * sr))    # 10 ms hop
+    if arr.size <= frame:
+        return arr
+
+    rms = []
+    for start in range(0, arr.size - frame + 1, hop):
+        chunk = arr[start:start + frame]
+        rms.append(float(np.sqrt(np.mean(chunk * chunk))))
+    if not rms:
+        return arr
+
+    rms = np.asarray(rms, dtype=np.float32)
+    smooth = np.convolve(rms, np.ones(5, dtype=np.float32) / 5.0, mode="same")
+    peak_rms = float(np.max(smooth))
+    if peak_rms <= 1e-8:
+        return arr
+
+    # Use a conservative floor estimate so low-energy final phonemes are preserved.
+    noise_floor = float(np.percentile(smooth, 5))
+    threshold = max(noise_floor * 1.8, peak_rms * 0.03)
+    voiced = np.where(smooth > threshold)[0]
+    if voiced.size == 0:
+        return arr
+
+    last_voiced = int(voiced[-1])
+    trailing_silence_sec = (len(smooth) - 1 - last_voiced) * hop / float(sr)
+    if trailing_silence_sec < 0.30:
+        return arr
+
+    keep_tail = int(0.100 * sr)  # keep 100 ms to avoid abrupt cutoff
+    end = min(int(arr.size), last_voiced * hop + frame + keep_tail)
+    return arr[:end]
+
+
 def _int8_qconfig_spec(model, scheme):
     normalized = str(scheme).strip().lower()
     if normalized == "all_linear":
@@ -234,13 +275,21 @@ def run_fp32(text, fp32_dir, spk_emb, out_prefix):
     wav, latency = synthesize(model, inputs, spk_emb, vocoder, device)
 
     out_path = Path(f"{out_prefix}_fp32.wav")
+    wav = _trim_trailing_silence(wav, sample_rate=16000)
     wav = _sanitize_wav_for_export(wav)
     sf.write(str(out_path), wav, 16000, subtype="PCM_16")
 
     return {"path": out_path, "latency": latency, "device": device}
 
 
-def run_int8(text, int8_dir, spk_emb, out_prefix, fp32_dir=None, int8_strategy="auto"):
+def run_int8(
+    text,
+    int8_dir,
+    spk_emb,
+    out_prefix,
+    fp32_dir=None,
+    int8_strategy="auto",
+):
     device = torch.device("cpu")
     _configure_runtime(device)
     print(f"\n[INT8] Loading model on {device} from: {int8_dir}")
@@ -261,6 +310,7 @@ def run_int8(text, int8_dir, spk_emb, out_prefix, fp32_dir=None, int8_strategy="
     wav, latency = synthesize(model, inputs, spk_emb, vocoder, device)
 
     out_path = Path(f"{out_prefix}_int8.wav")
+    wav = _trim_trailing_silence(wav, sample_rate=16000)
     wav = _sanitize_wav_for_export(wav)
     sf.write(str(out_path), wav, 16000, subtype="PCM_16")
 
