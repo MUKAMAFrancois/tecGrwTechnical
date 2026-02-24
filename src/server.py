@@ -8,8 +8,8 @@ from typing import Literal
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from transformers import (
     SpeechT5Config,
@@ -215,7 +215,20 @@ def health():
     return JSONResponse(runtime.health())
 
 
-@app.post("/synthesize")
+@app.post(
+    "/synthesize",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "Synthesized speech WAV audio.",
+            "content": {
+                "audio/wav": {
+                    "schema": {"type": "string", "format": "binary"}
+                }
+            },
+        }
+    },
+)
 def synthesize(request: SynthesizeRequest):
     try:
         wav, sr, latency_ms = runtime.synthesize(request.text, request.mode)
@@ -229,5 +242,6 @@ def synthesize(request: SynthesizeRequest):
     headers = {
         "X-TTS-Mode": request.mode,
         "X-TTS-Latency-Ms": f"{latency_ms:.2f}",
+        "Content-Disposition": f'attachment; filename="synthesize_{request.mode}.wav"',
     }
-    return StreamingResponse(buffer, media_type="audio/wav", headers=headers)
+    return Response(content=buffer.getvalue(), media_type="audio/wav", headers=headers)

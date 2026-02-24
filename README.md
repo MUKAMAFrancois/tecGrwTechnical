@@ -78,3 +78,27 @@ Docker expects local artifacts mounted by `docker-compose.yml`:
 - INT8 in this project uses dynamic quantization on `nn.Linear` layers.
 - Audio files are exported as PCM-16 WAV for broad player compatibility.
 - CPU latency sometimes are above strict real-time targets; on GPU `<800ms> is met at short sentences.
+
+
+## running swagger UI (local machine)
+
+- set the paths.
+        $env:TTS_FP32_DIR = (Resolve-Path .\speecht5_fp32_infer).Path
+        $env:TTS_INT8_DIR = (Resolve-Path .\speecht5_int8_deployment).Path
+        $env:TTS_SPEAKER_PATH = (Resolve-Path .\speaker_embedding.pt).Path
+- run the command to launc the uvicorn server.
+        uv run --active python -m uvicorn src.server:app --host 127.0.0.1 --port 8000
+
+- you can also use the powershell command.
+        @'
+        {"text":"amakuru yawe?","mode":"fp32"}
+        '@ | Set-Content -Path body.json -NoNewline
+
+        curl.exe -sS -X POST "http://127.0.0.1:8000/synthesize" `
+        -H "Content-Type: application/json" `
+        --data-binary "@body.json" `
+        --output demo_fp32.wav
+
+
+        Format-Hex -Path .\demo_fp32.wav | Select-Object -First 1
+        Get-Item .\demo_fp32.wav | Select-Object Name,Length
